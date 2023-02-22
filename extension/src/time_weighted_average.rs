@@ -15,21 +15,18 @@ use crate::{
     pg_type, ron_inout_funcs,
 };
 
-use tspoint::TSPoint;
-
-use time_weighted_average::{
-    TimeWeightError, TimeWeightMethod, TimeWeightSummary as TimeWeightSummaryInternal,
-};
+use time_weighted_average::{TimeWeightError, TimeWeightMethod, TimeWeightSummary as TimeWeightSummaryInternal, TSNullablePoint};
 
 use crate::raw::bytea;
 
 pg_type! {
     #[derive(Debug)]
     struct TimeWeightSummary {
-        first: TSPoint,
-        last: TSPoint,
+        first: TSNullablePoint,
+        last: TSNullablePoint,
         weighted_sum: f64,
         method: TimeWeightMethod,
+        duration_data: i64,
     }
 }
 ron_inout_funcs!(TimeWeightSummary);
@@ -41,6 +38,7 @@ impl<'input> TimeWeightSummary<'input> {
             first: self.first,
             last: self.last,
             w_sum: self.weighted_sum,
+            duration_data: self.duration_data,
         }
     }
 
@@ -69,7 +67,7 @@ impl<'input> TimeWeightSummary<'input> {
             Some(prev) if interval_start < self.first.ts => {
                 let new_start = self
                     .method
-                    .interpolate(prev.last, Some(self.first), interval_start)
+                    .interpolate_nullable(prev.last, Some(self.first), interval_start)
                     .expect("unable to interpolate start of interval");
                 new_sum += self.method.weighted_sum(new_start, self.first);
                 new_start
@@ -80,20 +78,28 @@ impl<'input> TimeWeightSummary<'input> {
             Some(next) => {
                 let new_end = self
                     .method
-                    .interpolate(self.last, Some(next.first), end)
+                    .interpolate_nullable(self.last, Some(next.first), end)
                     .expect("unable to interpolate end of interval");
                 new_sum += self.method.weighted_sum(self.last, new_end);
                 new_end
             }
             _ => self.last,
         };
+        let mut new_duration_data = self.duration_data;
+        if new_start.val.is_some() {
+            new_duration_data += self.first.ts - new_start.ts;
+        }
+        if self.last.val.is_some() {
+            new_duration_data += new_end.ts - self.last.ts;
+        }
 
         unsafe {
-            crate::flatten!(TimeWeightSummary {
+            flatten!(TimeWeightSummary {
                 first: new_start,
                 last: new_end,
                 weighted_sum: new_sum,
                 method: self.method,
+                duration_data: new_duration_data,
             })
         }
     }
@@ -102,13 +108,13 @@ impl<'input> TimeWeightSummary<'input> {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct TimeWeightTransState {
     #[serde(skip)]
-    point_buffer: Vec<TSPoint>,
+    point_buffer: Vec<TSNullablePoint>,
     method: TimeWeightMethod,
     summary_buffer: Vec<TimeWeightSummaryInternal>,
 }
 
 impl TimeWeightTransState {
-    fn push_point(&mut self, value: TSPoint) {
+    fn push_point(&mut self, value: TSNullablePoint) {
         self.point_buffer.push(value);
     }
 
@@ -179,10 +185,9 @@ pub fn time_weight_trans_inner(
 ) -> Option<Inner<TimeWeightTransState>> {
     unsafe {
         in_aggregate_context(fcinfo, || {
-            let p = match (ts, val) {
-                (_, None) => return state,
-                (None, _) => return state,
-                (Some(ts), Some(val)) => TSPoint { ts: ts.into(), val },
+            let p = match ts {
+                None => return state,
+                Some(ts) => TSNullablePoint { ts: ts.into(), val },
             };
 
             match state {
@@ -315,6 +320,7 @@ fn time_weight_final_inner(
                     first: st.first,
                     last: st.last,
                     weighted_sum: st.w_sum,
+                    duration_data: st.duration_data,
                 })
             })
         })
@@ -326,12 +332,12 @@ fn time_weight_final_inner(
 pub fn arrow_time_weight_first_val<'a>(
     sketch: TimeWeightSummary<'a>,
     _accessor: AccessorFirstVal<'a>,
-) -> f64 {
+) -> Option<f64> {
     time_weight_first_val(sketch)
 }
 
 #[pg_extern(name = "first_val", strict, immutable, parallel_safe)]
-fn time_weight_first_val<'a>(summary: TimeWeightSummary<'a>) -> f64 {
+fn time_weight_first_val<'a>(summary: TimeWeightSummary<'a>) -> Option<f64> {
     summary.first.val
 }
 
@@ -340,12 +346,12 @@ fn time_weight_first_val<'a>(summary: TimeWeightSummary<'a>) -> f64 {
 pub fn arrow_time_weight_last_val<'a>(
     sketch: TimeWeightSummary<'a>,
     _accessor: AccessorLastVal<'a>,
-) -> f64 {
+) -> Option<f64> {
     time_weight_last_val(sketch)
 }
 
 #[pg_extern(name = "last_val", strict, immutable, parallel_safe)]
-fn time_weight_last_val<'a>(summary: TimeWeightSummary<'a>) -> f64 {
+fn time_weight_last_val<'a>(summary: TimeWeightSummary<'a>) -> Option<f64> {
     summary.last.val
 }
 
@@ -475,42 +481,33 @@ pub fn time_weighted_average_integral<'a>(
 fn interpolate<'a>(
     tws: Option<TimeWeightSummary>,
     start: crate::raw::TimestampTz,
-    duration: crate::raw::Interval,
+    interval: crate::raw::Interval,
     prev: Option<TimeWeightSummary>,
     next: Option<TimeWeightSummary>,
 ) -> Option<TimeWeightSummary<'a>> {
     match tws {
         None => None,
         Some(tws) => {
-            let interval = crate::datum_utils::interval_to_ms(&start, &duration);
+            let interval = crate::datum_utils::interval_to_ms(&start, &interval);
             Some(tws.interpolate(start.into(), interval, prev, next))
         }
     }
 }
 
-// Public facing interpolated_average
-extension_sql!(
-    "\n\
-     CREATE FUNCTION toolkit_experimental.interpolated_average(tws timeweightsummary,\n\
-          start timestamptz,\n\
-          duration interval,\n\
-          prev timeweightsummary,\n\
-          next timeweightsummary) RETURNS DOUBLE PRECISION\n\
-     AS $$\n\
-          SELECT interpolated_average(tws,start,duration,prev,next) $$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE;\n\
-",
-    name = "experimental_interpolated_average", requires = [time_weighted_average_interpolated_average]
-);
-
-#[pg_extern(immutable, parallel_safe, name = "interpolated_average")]
+#[pg_extern(
+    immutable,
+    parallel_safe,
+    name = "interpolated_average",
+    schema = "toolkit_experimental"
+)]
 pub fn time_weighted_average_interpolated_average<'a>(
     tws: Option<TimeWeightSummary<'a>>,
     start: crate::raw::TimestampTz,
-    duration: crate::raw::Interval,
+    interval: crate::raw::Interval,
     prev: Option<TimeWeightSummary<'a>>,
     next: Option<TimeWeightSummary<'a>>,
 ) -> Option<f64> {
-    let target = interpolate(tws, start, duration, prev, next);
+    let target = interpolate(tws, start, interval, prev, next);
     time_weighted_average_average(target)
 }
 
@@ -536,138 +533,136 @@ pub fn time_weighted_average_interpolated_integral<'a>(
 #[pg_schema]
 mod tests {
     use super::*;
-
+    use pgx::spi::Spi;
     use pgx_macros::pg_test;
     macro_rules! select_one {
         ($client:expr, $stmt:expr, $type:ty) => {
             $client
-                .update($stmt, None, None)
-                .unwrap()
+                .select($stmt, None, None)
                 .first()
                 .get_one::<$type>()
-                .unwrap()
                 .unwrap()
         };
     }
     #[pg_test]
     fn test_time_weight_aggregate() {
-        Spi::connect(|mut client| {
+        Spi::connect(|client| {
             let stmt =
                 "CREATE TABLE test(ts timestamptz, val DOUBLE PRECISION); SET TIME ZONE 'UTC'";
-            client.update(stmt, None, None).unwrap();
+            client.select(stmt, None, None);
 
             // add a point
             let stmt = "INSERT INTO test VALUES('2020-01-01 00:00:00+00', 10.0)";
-            client.update(stmt, None, None).unwrap();
+            client.select(stmt, None, None);
 
             let stmt = "SELECT toolkit_experimental.integral(time_weight('Trapezoidal', ts, val), 'hrs') FROM test";
-            assert_eq!(select_one!(client, stmt, f64), 0.0);
+            assert_eq!(select_one!(client, stmt, f64).unwrap(), 0.0);
             let stmt = "SELECT toolkit_experimental.integral(time_weight('LOCF', ts, val), 'msecond') FROM test";
-            assert_eq!(select_one!(client, stmt, f64), 0.0);
+            assert_eq!(select_one!(client, stmt, f64).unwrap(), 0.0);
 
             // add another point
             let stmt = "INSERT INTO test VALUES('2020-01-01 00:01:00+00', 20.0)";
-            client.update(stmt, None, None).unwrap();
+            client.select(stmt, None, None);
 
             // test basic with 2 points
             let stmt = "SELECT average(time_weight('Linear', ts, val)) FROM test";
-            assert!((select_one!(client, stmt, f64) - 15.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 15.0).abs() < f64::EPSILON);
             let stmt = "SELECT average(time_weight('LOCF', ts, val)) FROM test";
-            assert!((select_one!(client, stmt, f64) - 10.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 10.0).abs() < f64::EPSILON);
 
             let stmt = "SELECT first_val(time_weight('LOCF', ts, val)) FROM test";
-            assert!((select_one!(client, stmt, f64) - 10.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 10.0).abs() < f64::EPSILON);
             let stmt = "SELECT last_val(time_weight('LOCF', ts, val)) FROM test";
-            assert!((select_one!(client, stmt, f64) - 20.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 20.0).abs() < f64::EPSILON);
 
             // arrow syntax should be the same
             let stmt = "SELECT time_weight('LOCF', ts, val) -> first_val() FROM test";
-            assert!((select_one!(client, stmt, f64) - 10.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 10.0).abs() < f64::EPSILON);
             let stmt = "SELECT time_weight('LOCF', ts, val) -> last_val() FROM test";
-            assert!((select_one!(client, stmt, f64) - 20.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 20.0).abs() < f64::EPSILON);
 
             let stmt = "SELECT first_time(time_weight('LOCF', ts, val))::text FROM test";
-            assert_eq!(select_one!(client, stmt, &str), "2020-01-01 00:00:00+00");
+            assert_eq!(select_one!(client, stmt, &str).unwrap(), "2020-01-01 00:00:00+00");
             let stmt = "SELECT last_time(time_weight('LOCF', ts, val))::text FROM test";
-            assert_eq!(select_one!(client, stmt, &str), "2020-01-01 00:01:00+00");
+            assert_eq!(select_one!(client, stmt, &str).unwrap(), "2020-01-01 00:01:00+00");
 
             // arrow syntax should be the same
             let stmt = "SELECT (time_weight('LOCF', ts, val) -> first_time())::text FROM test";
-            assert_eq!(select_one!(client, stmt, &str), "2020-01-01 00:00:00+00");
+            assert_eq!(select_one!(client, stmt, &str).unwrap(), "2020-01-01 00:00:00+00");
             let stmt = "SELECT (time_weight('LOCF', ts, val) -> last_time())::text FROM test";
-            assert_eq!(select_one!(client, stmt, &str), "2020-01-01 00:01:00+00");
+            assert_eq!(select_one!(client, stmt, &str).unwrap(), "2020-01-01 00:01:00+00");
 
             // more values evenly spaced
             let stmt = "INSERT INTO test VALUES('2020-01-01 00:02:00+00', 10.0), ('2020-01-01 00:03:00+00', 20.0), ('2020-01-01 00:04:00+00', 10.0)";
-            client.update(stmt, None, None).unwrap();
+            client.select(stmt, None, None);
 
             let stmt = "SELECT average(time_weight('Linear', ts, val)) FROM test";
-            assert!((select_one!(client, stmt, f64) - 15.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 15.0).abs() < f64::EPSILON);
             let stmt = "SELECT average(time_weight('LOCF', ts, val)) FROM test";
-            assert!((select_one!(client, stmt, f64) - 15.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 15.0).abs() < f64::EPSILON);
 
             let stmt = "SELECT toolkit_experimental.integral(time_weight('Linear', ts, val), 'mins') FROM test";
-            assert!((select_one!(client, stmt, f64) - 60.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 60.0).abs() < f64::EPSILON);
             let stmt = "SELECT toolkit_experimental.integral(time_weight('LOCF', ts, val), 'hour') FROM test";
-            assert!((select_one!(client, stmt, f64) - 1.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 1.0).abs() < f64::EPSILON);
 
             //non-evenly spaced values
             let stmt = "INSERT INTO test VALUES('2020-01-01 00:08:00+00', 30.0), ('2020-01-01 00:10:00+00', 10.0), ('2020-01-01 00:10:30+00', 20.0), ('2020-01-01 00:20:00+00', 30.0)";
-            client.update(stmt, None, None).unwrap();
+            client.select(stmt, None, None);
 
             let stmt = "SELECT average(time_weight('Linear', ts, val)) FROM test";
             // expected =(15 +15 +15 +15 + 20*4 + 20*2 +15*.5 + 25*9.5) / 20 = 21.25 just taking the midpoints between each point and multiplying by minutes and dividing by total
-            assert!((select_one!(client, stmt, f64) - 21.25).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 21.25).abs() < f64::EPSILON);
             let stmt = "SELECT time_weight('Linear', ts, val) \
                 ->average() \
             FROM test";
             // arrow syntax should be the same
-            assert!((select_one!(client, stmt, f64) - 21.25).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 21.25).abs() < f64::EPSILON);
 
             let stmt = "SELECT toolkit_experimental.integral(time_weight('Linear', ts, val), 'microseconds') FROM test";
-            assert!((select_one!(client, stmt, f64) - 25500000000.00).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 25500000000.00).abs() < f64::EPSILON);
             let stmt = "SELECT time_weight('Linear', ts, val) \
                 ->toolkit_experimental.integral('microseconds') \
             FROM test";
             // arrow syntax should be the same
-            assert!((select_one!(client, stmt, f64) - 25500000000.00).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 25500000000.00).abs() < f64::EPSILON);
             let stmt = "SELECT time_weight('Linear', ts, val) \
                 ->toolkit_experimental.integral() \
             FROM test";
-            assert!((select_one!(client, stmt, f64) - 25500.00).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 25500.00).abs() < f64::EPSILON);
 
             let stmt = "SELECT average(time_weight('LOCF', ts, val)) FROM test";
             // expected = (10 + 20 + 10 + 20 + 10*4 + 30*2 +10*.5 + 20*9.5) / 20 = 17.75 using last value and carrying for each point
-            assert!((select_one!(client, stmt, f64) - 17.75).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 17.75).abs() < f64::EPSILON);
 
             let stmt = "SELECT toolkit_experimental.integral(time_weight('LOCF', ts, val), 'milliseconds') FROM test";
-            assert!((select_one!(client, stmt, f64) - 21300000.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 21300000.0).abs() < f64::EPSILON);
 
             //make sure this works with whatever ordering we throw at it
             let stmt = "SELECT average(time_weight('Linear', ts, val ORDER BY random())) FROM test";
-            assert!((select_one!(client, stmt, f64) - 21.25).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 21.25).abs() < f64::EPSILON);
             let stmt = "SELECT average(time_weight('LOCF', ts, val ORDER BY random())) FROM test";
-            assert!((select_one!(client, stmt, f64) - 17.75).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 17.75).abs() < f64::EPSILON);
 
             let stmt = "SELECT toolkit_experimental.integral(time_weight('Linear', ts, val ORDER BY random()), 'seconds') FROM test";
-            assert!((select_one!(client, stmt, f64) - 25500.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 25500.0).abs() < f64::EPSILON);
             let stmt = "SELECT toolkit_experimental.integral(time_weight('LOCF', ts, val ORDER BY random())) FROM test";
-            assert!((select_one!(client, stmt, f64) - 21300.0).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 21300.0).abs() < f64::EPSILON);
 
             // make sure we get the same result if we do multi-level aggregation
             let stmt = "WITH t AS (SELECT date_trunc('minute', ts), time_weight('Linear', ts, val) AS tws FROM test GROUP BY 1) SELECT average(rollup(tws)) FROM t";
-            assert!((select_one!(client, stmt, f64) - 21.25).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 21.25).abs() < f64::EPSILON);
             let stmt = "WITH t AS (SELECT date_trunc('minute', ts), time_weight('LOCF', ts, val) AS tws FROM test GROUP BY 1) SELECT average(rollup(tws)) FROM t";
-            assert!((select_one!(client, stmt, f64) - 17.75).abs() < f64::EPSILON);
+            assert!((select_one!(client, stmt, f64).unwrap() - 17.75).abs() < f64::EPSILON);
         });
     }
 
     #[pg_test]
     fn test_time_weight_io() {
-        Spi::connect(|mut client| {
-            client.update("SET timezone TO 'UTC'", None, None).unwrap();
+        Spi::connect(|client| {
+            client.select("SET timezone TO 'UTC'", None, None);
             let stmt = "CREATE TABLE test(ts timestamptz, val DOUBLE PRECISION)";
-            client.update(stmt, None, None).unwrap();
+            client.select(stmt, None, None);
 
             let linear_time_weight = "SELECT time_weight('Linear', ts, val)::TEXT FROM test";
             let locf_time_weight = "SELECT time_weight('LOCF', ts, val)::TEXT FROM test";
@@ -675,7 +670,7 @@ mod tests {
 
             // add a couple points
             let stmt = "INSERT INTO test VALUES('2020-01-01 00:00:00+00', 10.0), ('2020-01-01 00:01:00+00', 20.0)";
-            client.update(stmt, None, None).unwrap();
+            client.select(stmt, None, None);
 
             // test basic with 2 points
             let expected = "(\
@@ -685,8 +680,8 @@ mod tests {
                 weighted_sum:900000000,\
                 method:Linear\
             )";
-            assert_eq!(select_one!(client, linear_time_weight, String), expected);
-            assert!((select_one!(client, &*avg(expected), f64) - 15.0).abs() < f64::EPSILON);
+            assert_eq!(select_one!(client, linear_time_weight, String).unwrap(), expected);
+            assert!((select_one!(client, &*avg(expected), f64).unwrap() - 15.0).abs() < f64::EPSILON);
 
             let expected = "(\
                 version:1,\
@@ -695,12 +690,12 @@ mod tests {
                 weighted_sum:600000000,\
                 method:LOCF\
             )";
-            assert_eq!(select_one!(client, locf_time_weight, String), expected);
-            assert!((select_one!(client, &*avg(expected), f64) - 10.0).abs() < f64::EPSILON);
+            assert_eq!(select_one!(client, locf_time_weight, String).unwrap(), expected);
+            assert!((select_one!(client, &*avg(expected), f64).unwrap() - 10.0).abs() < f64::EPSILON);
 
             // more values evenly spaced
             let stmt = "INSERT INTO test VALUES('2020-01-01 00:02:00+00', 10.0), ('2020-01-01 00:03:00+00', 20.0), ('2020-01-01 00:04:00+00', 10.0)";
-            client.update(stmt, None, None).unwrap();
+            client.select(stmt, None, None);
 
             let expected = "(\
                 version:1,\
@@ -709,8 +704,8 @@ mod tests {
                 weighted_sum:3600000000,\
                 method:Linear\
             )";
-            assert_eq!(select_one!(client, linear_time_weight, String), expected);
-            assert!((select_one!(client, &*avg(expected), f64) - 15.0).abs() < f64::EPSILON);
+            assert_eq!(select_one!(client, linear_time_weight, String).unwrap(), expected);
+            assert!((select_one!(client, &*avg(expected), f64).unwrap() - 15.0).abs() < f64::EPSILON);
             let expected = "(\
                 version:1,\
                 first:(ts:\"2020-01-01 00:00:00+00\",val:10),\
@@ -718,12 +713,12 @@ mod tests {
                 weighted_sum:3600000000,\
                 method:LOCF\
             )";
-            assert_eq!(select_one!(client, locf_time_weight, String), expected);
-            assert!((select_one!(client, &*avg(expected), f64) - 15.0).abs() < f64::EPSILON);
+            assert_eq!(select_one!(client, locf_time_weight, String).unwrap(), expected);
+            assert!((select_one!(client, &*avg(expected), f64).unwrap() - 15.0).abs() < f64::EPSILON);
 
             //non-evenly spaced values
             let stmt = "INSERT INTO test VALUES('2020-01-01 00:08:00+00', 30.0), ('2020-01-01 00:10:00+00', 10.0), ('2020-01-01 00:10:30+00', 20.0), ('2020-01-01 00:20:00+00', 30.0)";
-            client.update(stmt, None, None).unwrap();
+            client.select(stmt, None, None);
 
             let expected = "(\
                 version:1,\
@@ -732,8 +727,8 @@ mod tests {
                 weighted_sum:25500000000,\
                 method:Linear\
             )";
-            assert_eq!(select_one!(client, linear_time_weight, String), expected);
-            assert!((select_one!(client, &*avg(expected), f64) - 21.25).abs() < f64::EPSILON);
+            assert_eq!(select_one!(client, linear_time_weight, String).unwrap(), expected);
+            assert!((select_one!(client, &*avg(expected), f64).unwrap() - 21.25).abs() < f64::EPSILON);
             let expected = "(\
                 version:1,\
                 first:(ts:\"2020-01-01 00:00:00+00\",val:10),\
@@ -741,8 +736,8 @@ mod tests {
                 weighted_sum:21300000000,\
                 method:LOCF\
             )";
-            assert_eq!(select_one!(client, locf_time_weight, String), expected);
-            assert!((select_one!(client, &*avg(expected), f64) - 17.75).abs() < f64::EPSILON);
+            assert_eq!(select_one!(client, locf_time_weight, String).unwrap(), expected);
+            assert!((select_one!(client, &*avg(expected), f64).unwrap() - 17.75).abs() < f64::EPSILON);
         });
     }
 
@@ -818,15 +813,14 @@ mod tests {
 
     #[pg_test]
     fn test_time_weight_interpolation() {
-        Spi::connect(|mut client| {
-            client.update(
+        Spi::connect(|client| {
+            client.select(
                 "CREATE TABLE test(time timestamptz, value double precision, bucket timestamptz)",
                 None,
                 None,
-            ).unwrap();
-            client
-                .update(
-                    r#"INSERT INTO test VALUES
+            );
+            client.select(
+                r#"INSERT INTO test VALUES
                 ('2020-1-1 8:00'::timestamptz, 10.0, '2020-1-1'::timestamptz),
                 ('2020-1-1 12:00'::timestamptz, 40.0, '2020-1-1'::timestamptz),
                 ('2020-1-1 16:00'::timestamptz, 20.0, '2020-1-1'::timestamptz),
@@ -834,16 +828,14 @@ mod tests {
                 ('2020-1-2 12:00'::timestamptz, 50.0, '2020-1-2'::timestamptz),
                 ('2020-1-2 20:00'::timestamptz, 25.0, '2020-1-2'::timestamptz),
                 ('2020-1-3 10:00'::timestamptz, 30.0, '2020-1-3'::timestamptz),
-                ('2020-1-3 12:00'::timestamptz, 0.0, '2020-1-3'::timestamptz), 
+                ('2020-1-3 12:00'::timestamptz, 0.0, '2020-1-3'::timestamptz),
                 ('2020-1-3 16:00'::timestamptz, 35.0, '2020-1-3'::timestamptz)"#,
-                    None,
-                    None,
-                )
-                .unwrap();
-            // test experimental version
-            let mut experimental_averages = client
-                .update(
-                    r#"SELECT
+                None,
+                None,
+            );
+
+            let mut averages = client.select(
+                r#"SELECT
                 toolkit_experimental.interpolated_average(
                     agg,
                     bucket,
@@ -851,59 +843,35 @@ mod tests {
                     LAG(agg) OVER (ORDER BY bucket),
                     LEAD(agg) OVER (ORDER BY bucket)
                 ) FROM (
-                    SELECT bucket, time_weight('LOCF', time, value) as agg 
-                    FROM test 
+                    SELECT bucket, time_weight('LOCF', time, value) as agg
+                    FROM test
                     GROUP BY bucket
                 ) s
                 ORDER BY bucket"#,
-                    None,
-                    None,
-                )
-                .unwrap();
-            // test non_experimental version
-            let mut averages = client
-                .update(
-                    r#"SELECT
-                interpolated_average(
+                None,
+                None,
+            );
+            let mut integrals = client.select(
+                r#"SELECT
+                toolkit_experimental.interpolated_integral(
                     agg,
                     bucket,
                     '1 day'::interval,
                     LAG(agg) OVER (ORDER BY bucket),
-                    LEAD(agg) OVER (ORDER BY bucket)
-                ) FROM (
-                    SELECT bucket, time_weight('LOCF', time, value) as agg 
-                    FROM test 
-                    GROUP BY bucket
-                ) s
-                ORDER BY bucket"#,
-                    None,
-                    None,
-                )
-                .unwrap();
-            let mut integrals = client
-                .update(
-                    r#"SELECT
-                toolkit_experimental.interpolated_integral(
-                    agg,
-                    bucket,
-                    '1 day'::interval, 
-                    LAG(agg) OVER (ORDER BY bucket),
                     LEAD(agg) OVER (ORDER BY bucket),
                     'hours'
                 ) FROM (
-                    SELECT bucket, time_weight('LOCF', time, value) as agg 
-                    FROM test 
+                    SELECT bucket, time_weight('LOCF', time, value) as agg
+                    FROM test
                     GROUP BY bucket
                 ) s
                 ORDER BY bucket"#,
-                    None,
-                    None,
-                )
-                .unwrap();
+                None,
+                None,
+            );
             // verify that default value works
-            client
-                .update(
-                    r#"SELECT
+            client.select(
+                r#"SELECT
                 toolkit_experimental.interpolated_integral(
                     agg,
                     bucket,
@@ -916,40 +884,37 @@ mod tests {
                     GROUP BY bucket
                 ) s
                 ORDER BY bucket"#,
-                    None,
-                    None,
-                )
-                .unwrap();
+                None,
+                None,
+            );
 
             // Day 1, 4 hours @ 10, 4 @ 40, 8 @ 20
-            let result = experimental_averages.next().unwrap()[1].value().unwrap();
-            assert_eq!(result, Some((4. * 10. + 4. * 40. + 8. * 20.) / 16.));
-            assert_eq!(result, averages.next().unwrap()[1].value().unwrap());
-
             assert_eq!(
-                integrals.next().unwrap()[1].value().unwrap(),
+                averages.next().unwrap()[1].value(),
+                Some((4. * 10. + 4. * 40. + 8. * 20.) / 16.)
+            );
+            assert_eq!(
+                integrals.next().unwrap()[1].value(),
                 Some(4. * 10. + 4. * 40. + 8. * 20.)
             );
             // Day 2, 2 hours @ 20, 10 @ 15, 8 @ 50, 4 @ 25
-            let result = experimental_averages.next().unwrap()[1].value().unwrap();
             assert_eq!(
-                result,
+                averages.next().unwrap()[1].value(),
                 Some((2. * 20. + 10. * 15. + 8. * 50. + 4. * 25.) / 24.)
             );
-            assert_eq!(result, averages.next().unwrap()[1].value().unwrap());
             assert_eq!(
-                integrals.next().unwrap()[1].value().unwrap(),
+                integrals.next().unwrap()[1].value(),
                 Some(2. * 20. + 10. * 15. + 8. * 50. + 4. * 25.)
             );
             // Day 3, 10 hours @ 25, 2 @ 30, 4 @ 0
-            let result = experimental_averages.next().unwrap()[1].value().unwrap();
-            assert_eq!(result, Some((10. * 25. + 2. * 30.) / 16.));
-            assert_eq!(result, averages.next().unwrap()[1].value().unwrap());
             assert_eq!(
-                integrals.next().unwrap()[1].value().unwrap(),
+                averages.next().unwrap()[1].value(),
+                Some((10. * 25. + 2. * 30.) / 16.)
+            );
+            assert_eq!(
+                integrals.next().unwrap()[1].value(),
                 Some(10. * 25. + 2. * 30.)
             );
-            assert!(experimental_averages.next().is_none());
             assert!(averages.next().is_none());
             assert!(integrals.next().is_none());
         });
