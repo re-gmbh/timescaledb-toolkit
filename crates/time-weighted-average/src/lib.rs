@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use flat_serialize::FlatSerializable;
 
-use flat_serialize_macro::FlatSerializable;
+use flat_serialize_macro::{flat_serialize, FlatSerializable};
 use tspoint::TSPoint;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, FlatSerializable)]
@@ -10,11 +11,34 @@ pub enum TimeWeightMethod {
     Linear,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, FlatSerializable)]
+#[repr(C)]
 pub struct TSNullablePoint {
     pub ts: i64,
-    pub val: Option<f64>,
+    pub v: f64,
+    // an Option<f64> would have been nicer but that clashes with FlatSerializable
+    pub has: bool,
 }
+
+
+impl TSNullablePoint {
+    pub fn new(ts: i64, val: Option<f64>) -> Self {
+        Self {
+            ts,
+            v: val.unwrap_or(0.0),
+            has: val.is_some()
+        }
+    }
+
+    pub fn val(&self) -> Option<f64> {
+        if self.has {
+            Some(self.v)
+        } else {
+            None
+        }
+    }
+}
+
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct TimeWeightSummary {
@@ -60,7 +84,7 @@ impl TimeWeightSummary {
             return Ok(());
         }
         self.w_sum += self.method.weighted_sum(self.last, pt);
-        if self.last.val.is_some() {
+        if self.last.val().is_some() {
             self.duration_data += pt.ts - self.last.ts
         }
         self.last = pt;
@@ -87,7 +111,7 @@ impl TimeWeightSummary {
             first: self.first,
             last: next.last,
             w_sum: self.w_sum + next.w_sum + self.method.weighted_sum(self.last, next.first),
-            duration_data: self.duration_data + next.duration_data + match self.last.val {
+            duration_data: self.duration_data + next.duration_data + match self.last.val() {
                 None => 0,
                 Some(_) => next.first.ts - self.last.ts
             },
@@ -166,7 +190,7 @@ impl TimeWeightSummary {
             .method
             .interpolate_nullable(prev, Some(self.first), target_start)?;
         let w_sum = self.w_sum + self.method.weighted_sum(new_first, self.first);
-        let duration_data = self.duration_data + match prev.val {
+        let duration_data = self.duration_data + match prev.val() {
             None => 0,
             Some(_) => self.first.ts - target_start,
         };
@@ -198,7 +222,7 @@ impl TimeWeightSummary {
         let w_sum = self.w_sum + self.method.weighted_sum(self.last, new_last);
         let duration_data = self.duration_data + match next {
             None => 0,
-            Some(_) => match self.last.val {
+            Some(_) => match self.last.val() {
                 None => 0,
                 Some(_) => new_last.ts - self.last.ts
             }
@@ -273,10 +297,9 @@ impl TimeWeightMethod {
                 return Err(TimeWeightError::OrderError);
             }
         }
-        let pt = TSNullablePoint {
-            ts: target,
-            val: match (self, second) {
-                (TimeWeightMethod::LOCF, _) => first.val,
+        let pt = TSNullablePoint::new(target,
+            match (self, second) {
+                (TimeWeightMethod::LOCF, _) => first.val(),
                 // TODO make this a method on TimeWeightMethod?
                 (TimeWeightMethod::Linear, Some(second)) => {
                     Self::interpolate_linear_nullable(&first, &second, target)
@@ -284,8 +307,7 @@ impl TimeWeightMethod {
                 (TimeWeightMethod::Linear, None) => {
                     return Err(TimeWeightError::InterpolateMissingPoint)
                 }
-            },
-        };
+            });
         Ok(pt)
     }
 
@@ -297,7 +319,7 @@ impl TimeWeightMethod {
     }
 
     fn interpolate_linear_nullable(p1: &TSNullablePoint, p2: &TSNullablePoint, ts: i64) -> Option<f64> {
-        match (p1.val, p2.val) {
+        match (p1.val(), p2.val()) {
             (Some(v1), Some(v2)) => {
                 Some(Self::interpolate_linear((&p1.ts, &v1), (&p2.ts, &v2), ts))
             },
@@ -311,7 +333,7 @@ impl TimeWeightMethod {
         let duration = (second.ts - first.ts) as f64;
         match self {
             TimeWeightMethod::LOCF => {
-                match &first.val {
+                match &first.val() {
                     Some(val) => val * duration,
                     None => 0.0
                 }
@@ -324,7 +346,7 @@ impl TimeWeightMethod {
             //midpoint of the two.
             //TODO: Stable midpoint calc? http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2018/p0811r2.html
             TimeWeightMethod::Linear => {
-                match (&first.val, &second.val) {
+                match (&first.val(), &second.val()) {
                     (Some(v1), Some(v2)) => (v1 + v2) / 2.0 * duration,
                     _ => 0.0
                 }
@@ -348,48 +370,48 @@ mod tests {
 
     #[test]
     fn test_simple_accum_locf() {
-        let mut s = TimeWeightSummary::new(TSNullablePoint { ts: 0, val: Some(1.0) }, TimeWeightMethod::LOCF);
+        let mut s = TimeWeightSummary::new(TSNullablePoint::new(0,Some(1.0)), TimeWeightMethod::LOCF);
         assert_eq!(s.w_sum, 0.0);
-        s.accum(TSNullablePoint { ts: 10, val: Some(0.0) }).unwrap();
+        s.accum(TSNullablePoint::new(10, Some(0.0))).unwrap();
         assert_eq!(s.w_sum, 10.0);
-        s.accum(TSNullablePoint { ts: 20, val: Some(2.0) }).unwrap();
+        s.accum(TSNullablePoint::new(20, Some(2.0))).unwrap();
         assert_eq!(s.w_sum, 10.0);
-        s.accum(TSNullablePoint { ts: 30, val: Some(1.0) }).unwrap();
+        s.accum(TSNullablePoint::new(30, Some(1.0))).unwrap();
         assert_eq!(s.w_sum, 30.0);
-        s.accum(TSNullablePoint { ts: 40, val: Some(-3.0) }).unwrap();
+        s.accum(TSNullablePoint::new(40, Some(-3.0))).unwrap();
         assert_eq!(s.w_sum, 40.0);
-        s.accum(TSNullablePoint { ts: 50, val: Some(-3.0) }).unwrap();
+        s.accum(TSNullablePoint::new(50,Some(-3.0))).unwrap();
         assert_eq!(s.w_sum, 10.0);
     }
     #[test]
     fn test_simple_accum_linear() {
-        let mut s = TimeWeightSummary::new(TSNullablePoint { ts: 0, val: Some(1.0) }, TimeWeightMethod::Linear);
+        let mut s = TimeWeightSummary::new(TSNullablePoint::new(0, Some(1.0)), TimeWeightMethod::Linear);
         assert_eq!(s.w_sum, 0.0);
-        s.accum(TSNullablePoint { ts: 10, val: Some(0.0) }).unwrap();
+        s.accum(TSNullablePoint::new(10,Some(0.0))).unwrap();
         assert_eq!(s.w_sum, 5.0);
-        s.accum(TSNullablePoint { ts: 20, val: Some(2.0) }).unwrap();
+        s.accum(TSNullablePoint::new(20, Some(2.0))).unwrap();
         assert_eq!(s.w_sum, 15.0);
-        s.accum(TSNullablePoint { ts: 30, val: Some(1.0) }).unwrap();
+        s.accum(TSNullablePoint::new(30, Some(1.0))).unwrap();
         assert_eq!(s.w_sum, 30.0);
-        s.accum(TSNullablePoint { ts: 40, val: Some(-3.0) }).unwrap();
+        s.accum(TSNullablePoint::new(40, Some(-3.0))).unwrap();
         assert_eq!(s.w_sum, 20.0);
-        s.accum(TSNullablePoint { ts: 50, val: Some(-3.0) }).unwrap();
+        s.accum(TSNullablePoint::new(50,Some(-3.0))).unwrap();
         assert_eq!(s.w_sum, -10.0);
     }
 
     fn new_from_sorted_iter_test(t: TimeWeightMethod) {
         // simple test
-        let mut s = TimeWeightSummary::new(TSNullablePoint { ts: 0, val: Some(1.0) }, t);
-        s.accum(TSNullablePoint { ts: 10, val: Some(0.0) }).unwrap();
-        s.accum(TSNullablePoint { ts: 20, val: Some(2.0) }).unwrap();
-        s.accum(TSNullablePoint { ts: 30, val: Some(1.0) }).unwrap();
+        let mut s = TimeWeightSummary::new(TSNullablePoint::new(0, Some(1.0)), t);
+        s.accum(TSNullablePoint::new(10, Some(0.0))).unwrap();
+        s.accum(TSNullablePoint::new(20,  Some(2.0))).unwrap();
+        s.accum(TSNullablePoint::new(30, Some(1.0))).unwrap();
 
         let n = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 0, val: Some(1.0) },
-                &TSNullablePoint { ts: 10, val: Some(0.0) },
-                &TSNullablePoint { ts: 20, val: Some(2.0) },
-                &TSNullablePoint { ts: 30, val: Some(1.0) },
+                &TSNullablePoint::new(0,Some(1.0)),
+                &TSNullablePoint::new(10, Some(0.0)),
+                &TSNullablePoint::new(20, Some(2.0)),
+                &TSNullablePoint::new(30, Some(1.0)),
             ],
             t,
         )
@@ -397,9 +419,9 @@ mod tests {
         assert_eq!(s, n);
 
         //single value
-        let s = TimeWeightSummary::new(TSNullablePoint { ts: 0, val: Some(1.0) }, t);
+        let s = TimeWeightSummary::new(TSNullablePoint::new(0, Some(1.0)), t);
         let n =
-            TimeWeightSummary::new_from_sorted_iter(vec![&TSNullablePoint { ts: 0, val: Some(1.0) }], t).unwrap();
+            TimeWeightSummary::new_from_sorted_iter(vec![&TSNullablePoint::new(0, Some(1.0))], t).unwrap();
         assert_eq!(s, n);
 
         //no values should error
@@ -416,29 +438,29 @@ mod tests {
     fn combine_test(t: TimeWeightMethod) {
         let s = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 0, val: Some(1.0) },
-                &TSNullablePoint { ts: 10, val: Some(0.0) },
-                &TSNullablePoint { ts: 20, val: Some(2.0) },
-                &TSNullablePoint { ts: 30, val: Some(1.0) },
+                &TSNullablePoint::new(0,Some(1.0)),
+                &TSNullablePoint::new(10, Some(0.0)),
+                &TSNullablePoint::new(20, Some(2.0)),
+                &TSNullablePoint::new(30, Some(1.0)),
             ],
             t,
         )
         .unwrap();
         let s1 = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 0, val: Some(1.0) }, &TSNullablePoint { ts: 10, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(0, Some(1.0)), &TSNullablePoint::new(10, Some(0.0))],
             t,
         )
         .unwrap();
         let s2 = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 20, val: Some(2.0) }, &TSNullablePoint { ts: 30, val: Some(1.0) }],
+            vec![&TSNullablePoint::new(20, Some(2.0)), &TSNullablePoint::new(30,  Some(1.0))],
             t,
         )
         .unwrap();
         let s_comb = s1.combine(&s2).unwrap();
         assert_eq!(s, s_comb);
         // test combine with single val as well as multiple
-        let s21 = TimeWeightSummary::new(TSNullablePoint { ts: 20, val: Some(2.0) }, t);
-        let s22 = TimeWeightSummary::new(TSNullablePoint { ts: 30, val: Some(1.0) }, t);
+        let s21 = TimeWeightSummary::new(TSNullablePoint::new(20, Some(2.0)), t);
+        let s22 = TimeWeightSummary::new(TSNullablePoint::new(30, Some(1.0)), t);
         assert_eq!(s1.combine(&s21).unwrap().combine(&s22).unwrap(), s);
     }
     #[test]
@@ -449,30 +471,30 @@ mod tests {
 
     fn order_accum_test(t: TimeWeightMethod) {
         let s = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 0, val: Some(1.0) }, &TSNullablePoint { ts: 10, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(0, Some(1.0)), &TSNullablePoint::new(10, Some(0.0))],
             t,
         )
         .unwrap();
         let mut o = s;
         // adding points at the same timestamp shouldn't affect the value (no matter whether the
         // value is larger or smaller than the original)
-        o.accum(TSNullablePoint { ts: 10, val: Some(2.0) }).unwrap();
+        o.accum(TSNullablePoint::new(10, Some(2.0))).unwrap();
         assert_eq!(s, o);
-        o.accum(TSNullablePoint { ts: 10, val: Some(-1.0) }).unwrap();
+        o.accum(TSNullablePoint::new(10, Some(-1.0))).unwrap();
         assert_eq!(s, o);
 
         //but adding out of order points doesn't work
         assert_eq!(
-            o.accum(TSNullablePoint { ts: 5, val: Some(-1.0) }),
+            o.accum(TSNullablePoint::new(5, Some(-1.0))),
             Err(TimeWeightError::OrderError)
         );
 
         //same for new_from_sorted_iter - test that multiple values only the first is taken
         let n = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 0, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(2.0) },
-                &TSNullablePoint { ts: 30, val: Some(4.0) },
+                &TSNullablePoint::new(0, Some(1.0)),
+                &TSNullablePoint::new(20, Some(2.0)),
+                &TSNullablePoint::new(30, Some(4.0)),
             ],
             t,
         )
@@ -480,10 +502,10 @@ mod tests {
 
         let m = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 0, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(2.0) },
-                &TSNullablePoint { ts: 20, val: Some(0.0) },
-                &TSNullablePoint { ts: 30, val: Some(4.0) },
+                &TSNullablePoint::new(0, Some(1.0)),
+                &TSNullablePoint::new(20, Some(2.0)),
+                &TSNullablePoint::new(20, Some(0.0)),
+                &TSNullablePoint::new(30, Some(4.0)),
             ],
             t,
         )
@@ -493,9 +515,9 @@ mod tests {
         // but out of order inputs correctly error
         let n = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 0, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(2.0) },
-                &TSNullablePoint { ts: 10, val: Some(0.0) },
+                &TSNullablePoint::new(0, Some(1.0)),
+                &TSNullablePoint::new(20, Some(2.0)),
+                &TSNullablePoint::new(10, Some(0.0)),
             ],
             t,
         );
@@ -509,18 +531,18 @@ mod tests {
 
     fn order_combine_test(t: TimeWeightMethod) {
         let s = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 0, val: Some(1.0) }, &TSNullablePoint { ts: 10, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(0, Some(1.0)), &TSNullablePoint::new(10, Some(0.0))],
             t,
         )
         .unwrap();
         let smaller = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 5, val: Some(1.0) }, &TSNullablePoint { ts: 15, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(5, Some(1.0)), &TSNullablePoint::new(15, Some(0.0))],
             t,
         )
         .unwrap();
         // see note above, but
         let equal = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 10, val: Some(1.0) }, &TSNullablePoint { ts: 15, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(10, Some(1.0)), &TSNullablePoint::new(15, Some(0.0))],
             t,
         )
         .unwrap();
@@ -538,21 +560,21 @@ mod tests {
         //simple case
         let m = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 0, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(2.0) },
-                &TSNullablePoint { ts: 30, val: Some(0.0) },
-                &TSNullablePoint { ts: 40, val: Some(4.0) },
+                &TSNullablePoint::new(0, Some(1.0)),
+                &TSNullablePoint::new(20, Some(2.0)),
+                &TSNullablePoint::new(30, Some(0.0)),
+                &TSNullablePoint::new(40, Some(4.0)),
             ],
             t,
         )
         .unwrap();
         let a = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 0, val: Some(1.0) }, &TSNullablePoint { ts: 20, val: Some(2.0) }],
+            vec![&TSNullablePoint::new(0, Some(1.0)), &TSNullablePoint::new(20, Some(2.0))],
             t,
         )
         .unwrap();
         let b = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 30, val: Some(0.0) }, &TSNullablePoint { ts: 40, val: Some(4.0) }],
+            vec![&TSNullablePoint::new(30, Some(0.0)), &TSNullablePoint::new(40, Some(4.0))],
             t,
         )
         .unwrap();
@@ -564,13 +586,13 @@ mod tests {
         assert_eq!(m, n);
 
         //single values in TimeWeightSummaries are no problem
-        let c = TimeWeightSummary::new(TSNullablePoint { ts: 0, val: Some(1.0) }, t);
-        let d = TimeWeightSummary::new(TSNullablePoint { ts: 20, val: Some(2.0) }, t);
+        let c = TimeWeightSummary::new(TSNullablePoint::new(0, Some(1.0)), t);
+        let d = TimeWeightSummary::new(TSNullablePoint::new(20, Some(2.0)), t);
         let n = TimeWeightSummary::combine_sorted_iter(vec![&c, &d, &b]).unwrap();
         assert_eq!(m, n);
         // whether single values come first or later
-        let e = TimeWeightSummary::new(TSNullablePoint { ts: 30, val: Some(0.0) }, t);
-        let f = TimeWeightSummary::new(TSNullablePoint { ts: 40, val: Some(4.0) }, t);
+        let e = TimeWeightSummary::new(TSNullablePoint::new(30, Some(0.0)), t);
+        let f = TimeWeightSummary::new(TSNullablePoint::new(40, Some(4.0)), t);
         let n = TimeWeightSummary::combine_sorted_iter(vec![&a, &e, &f]).unwrap();
         assert_eq!(m, n);
 
@@ -597,24 +619,24 @@ mod tests {
     #[test]
     fn test_mismatch_combine() {
         let s1 = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 0, val: Some(1.0) }, &TSNullablePoint { ts: 10, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(0, Some(1.0)), &TSNullablePoint::new(10, Some(0.0))],
             TimeWeightMethod::LOCF,
         )
         .unwrap();
         let s2 = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 20, val: Some(2.0) }, &TSNullablePoint { ts: 30, val: Some(1.0) }],
+            vec![&TSNullablePoint::new(20, Some(2.0)), &TSNullablePoint::new(30, Some(1.0))],
             TimeWeightMethod::Linear,
         )
         .unwrap();
         assert_eq!(s1.combine(&s2), Err(TimeWeightError::MethodMismatch));
 
         let s1 = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 0, val: Some(1.0) }, &TSNullablePoint { ts: 10, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(0, Some(1.0)), &TSNullablePoint::new(10, Some(0.0))],
             TimeWeightMethod::Linear,
         )
         .unwrap();
         let s2 = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 20, val: Some(2.0) }, &TSNullablePoint { ts: 30, val: Some(1.0) }],
+            vec![&TSNullablePoint::new(20, Some(2.0)), &TSNullablePoint::new(30, Some(1.0))],
             TimeWeightMethod::LOCF,
         )
         .unwrap();
@@ -623,8 +645,8 @@ mod tests {
 
     #[test]
     fn test_weighted_sum() {
-        let pt1 = TSNullablePoint { ts: 10, val: Some(20.0) };
-        let pt2 = TSNullablePoint { ts: 20, val: Some(40.0) };
+        let pt1 = TSNullablePoint::new(10, Some(20.0));
+        let pt2 = TSNullablePoint::new(20, Some(40.0));
 
         let locf = TimeWeightMethod::LOCF.weighted_sum(pt1, pt2);
         assert_eq!(locf, 200.0);
@@ -632,7 +654,7 @@ mod tests {
         let linear = TimeWeightMethod::Linear.weighted_sum(pt1, pt2);
         assert_eq!(linear, 300.0);
 
-        let pt2 = TSNullablePoint { ts: 20, val: Some(-40.0) };
+        let pt2 = TSNullablePoint::new(20, Some(-40.0));
 
         let locf = TimeWeightMethod::LOCF.weighted_sum(pt1, pt2);
         assert_eq!(locf, 200.0);
@@ -643,23 +665,23 @@ mod tests {
 
     fn with_prev_common_test(t: TimeWeightMethod) {
         let test = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 10, val: Some(1.0) }, &TSNullablePoint { ts: 20, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(10, Some(1.0)), &TSNullablePoint::new(20, Some(0.0))],
             t,
         )
         .unwrap();
         // target = starting point should produce itself no matter the method
-        let prev = TSNullablePoint { ts: 5, val: Some(5.0) };
+        let prev = TSNullablePoint::new(5, Some(5.0));
         let target: i64 = 10;
         assert_eq!(test.with_prev(target, prev).unwrap(), test);
 
         // target = prev should always produce the same as if we made a new one with prev as the starting point, no matter the extrapolation method, though technically, this shouldn't come up in real world data, because you'd never target a place you had real data for, but that's fine, it's a useful reductive case for testing
-        let prev = TSNullablePoint { ts: 5, val: Some(5.0) };
+        let prev = TSNullablePoint::new(5, Some(5.0));
         let target: i64 = 5;
         let expected = TimeWeightSummary::new_from_sorted_iter(
             vec![
                 &prev,
-                &TSNullablePoint { ts: 10, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(0.0) },
+                &TSNullablePoint::new(10, Some(1.0)),
+                &TSNullablePoint::new(20, Some(0.0)),
             ],
             t,
         )
@@ -667,7 +689,7 @@ mod tests {
         assert_eq!(test.with_prev(target, prev).unwrap(), expected);
 
         // prev >= first should produce an order error
-        let prev = TSNullablePoint { ts: 10, val: Some(5.0) };
+        let prev = TSNullablePoint::new(10, Some(5.0));
         let target: i64 = 10;
         assert_eq!(
             test.with_prev(target, prev).unwrap_err(),
@@ -675,7 +697,7 @@ mod tests {
         );
 
         // target okay, but prev not less than it
-        let prev = TSNullablePoint { ts: 5, val: Some(5.0) };
+        let prev = TSNullablePoint::new(5, Some(5.0));
         let target: i64 = 2;
         assert_eq!(
             test.with_prev(target, prev).unwrap_err(),
@@ -683,7 +705,7 @@ mod tests {
         );
 
         // prev okay, but target > start
-        let prev = TSNullablePoint { ts: 5, val: Some(5.0) };
+        let prev = TSNullablePoint::new(5, Some(5.0));
         let target: i64 = 15;
         assert_eq!(
             test.with_prev(target, prev).unwrap_err(),
@@ -695,18 +717,18 @@ mod tests {
     fn test_with_prev() {
         // adding a previous point is the same as a TimeWeightSummary constructed from the properly extrapolated previous point and the original
         let test = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 10, val: Some(1.0) }, &TSNullablePoint { ts: 20, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(10, Some(1.0)), &TSNullablePoint::new(20, Some(0.0))],
             TimeWeightMethod::LOCF,
         )
         .unwrap();
-        let prev = TSNullablePoint { ts: 0, val: Some(5.0) };
+        let prev = TSNullablePoint::new(0, Some(5.0));
         let target: i64 = 5;
-        let expected_origin = TSNullablePoint { ts: 5, val: Some(5.0) };
+        let expected_origin = TSNullablePoint::new(5, Some(5.0));
         let expected = TimeWeightSummary::new_from_sorted_iter(
             vec![
                 &expected_origin,
-                &TSNullablePoint { ts: 10, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(0.0) },
+                &TSNullablePoint::new(10, Some(1.0)),
+                &TSNullablePoint::new(20, Some(0.0)),
             ],
             TimeWeightMethod::LOCF,
         )
@@ -715,18 +737,18 @@ mod tests {
 
         // if the Summary uses a linear method, the extrapolation should be linear as well
         let test = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 10, val: Some(1.0) }, &TSNullablePoint { ts: 20, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(10, Some(1.0)), &TSNullablePoint::new(20, Some(0.0))],
             TimeWeightMethod::Linear,
         )
         .unwrap();
-        let prev = TSNullablePoint { ts: 0, val: Some(5.0) };
+        let prev = TSNullablePoint::new(0, Some(5.0));
         let target: i64 = 5;
-        let expected_origin = TSNullablePoint { ts: 5, val: Some(3.0) };
+        let expected_origin = TSNullablePoint::new(5, Some(3.0));
         let expected = TimeWeightSummary::new_from_sorted_iter(
             vec![
                 &expected_origin,
-                &TSNullablePoint { ts: 10, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(0.0) },
+                &TSNullablePoint::new(10, Some(1.0)),
+                &TSNullablePoint::new(20, Some(0.0)),
             ],
             TimeWeightMethod::Linear,
         )
@@ -740,22 +762,22 @@ mod tests {
 
     fn with_next_common_test(t: TimeWeightMethod) {
         let test = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 10, val: Some(1.0) }, &TSNullablePoint { ts: 20, val: Some(0.0) }],
+            vec![&TSNullablePoint::new(10, Some(1.0)), &TSNullablePoint::new(20, Some(0.0))],
             t,
         )
         .unwrap();
         // target = end point should produce itself no matter the method
-        let next = TSNullablePoint { ts: 25, val: Some(5.0) };
+        let next = TSNullablePoint::new(25, Some(5.0));
         let target: i64 = 20;
         assert_eq!(test.with_next(target, Some(next)).unwrap(), test);
 
         // target = next should always produce the same as if we added the next point for linear,  and will produce the same w_sum, though not the same final point for LOCF, here' we'll test the w_sum. Though technically, this shouldn't come up in real world data, because you'd never target a place you had real data for, but that's fine, it's a useful reductive case for testing
-        let next = TSNullablePoint { ts: 25, val: Some(5.0) };
+        let next = TSNullablePoint::new(25, Some(5.0));
         let target: i64 = 25;
         let expected = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 10, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(0.0) },
+                &TSNullablePoint::new(10, Some(1.0)),
+                &TSNullablePoint::new(20, Some(0.0)),
                 &next,
             ],
             t,
@@ -767,7 +789,7 @@ mod tests {
         );
 
         // next <= last should produce an order error
-        let next = TSNullablePoint { ts: 20, val: Some(5.0) };
+        let next = TSNullablePoint::new(20, Some(5.0));
         let target: i64 = 22;
         assert_eq!(
             test.with_next(target, Some(next)).unwrap_err(),
@@ -775,7 +797,7 @@ mod tests {
         );
 
         // target okay, but next not greater than it
-        let next = TSNullablePoint { ts: 22, val: Some(5.0) };
+        let next = TSNullablePoint::new(22, Some(5.0));
         let target: i64 = 25;
         assert_eq!(
             test.with_next(target, Some(next)).unwrap_err(),
@@ -783,7 +805,7 @@ mod tests {
         );
 
         // next okay, but target < last
-        let next = TSNullablePoint { ts: 25, val: Some(5.0) };
+        let next = TSNullablePoint::new(25, Some(5.0));
         let target: i64 = 15;
         assert_eq!(
             test.with_next(target, Some(next)).unwrap_err(),
@@ -795,18 +817,18 @@ mod tests {
     fn test_with_next() {
         // adding a target_next point is the same as a TimeWeightSummary constructed from the properly extrapolated next point and the original
         let test = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 10, val: Some(1.0) },
-                 &TSNullablePoint { ts: 20, val: Some(2.0) }],
+            vec![&TSNullablePoint::new(10, Some(1.0)),
+                 &TSNullablePoint::new(20, Some(2.0))],
             TimeWeightMethod::LOCF,
         )
         .unwrap();
-        let next = TSNullablePoint { ts: 30, val: Some(3.0) };
+        let next = TSNullablePoint::new(30, Some(3.0));
         let target: i64 = 25;
-        let expected_next = TSNullablePoint { ts: 25, val: Some(2.0) };
+        let expected_next = TSNullablePoint::new(25, Some(2.0));
         let expected = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 10, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(2.0) },
+                &TSNullablePoint::new(10, Some(1.0)),
+                &TSNullablePoint::new(20, Some(2.0)),
                 &expected_next,
             ],
             TimeWeightMethod::LOCF,
@@ -822,17 +844,17 @@ mod tests {
 
         // if the Summary uses a linear method, the extrapolation should be linear as well
         let test = TimeWeightSummary::new_from_sorted_iter(
-            vec![&TSNullablePoint { ts: 10, val: Some(1.0) }, &TSNullablePoint { ts: 20, val: Some(2.0) }],
+            vec![&TSNullablePoint::new(10, Some(1.0)), &TSNullablePoint::new(20, Some(2.0))],
             TimeWeightMethod::Linear,
         )
         .unwrap();
-        let next = TSNullablePoint { ts: 30, val: Some(3.0) };
+        let next = TSNullablePoint::new(30, Some(3.0));
         let target: i64 = 25;
-        let expected_next = TSNullablePoint { ts: 25, val: Some(2.5) };
+        let expected_next = TSNullablePoint::new(25, Some(2.5));
         let expected = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 10, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(2.0) },
+                &TSNullablePoint::new(10, Some(1.0)),
+                &TSNullablePoint::new(20, Some(2.0)),
                 &expected_next,
             ],
             TimeWeightMethod::Linear,
@@ -852,7 +874,7 @@ mod tests {
 
     // add average tests
     fn average_common_tests(t: TimeWeightMethod) {
-        let single = TimeWeightSummary::new(TSNullablePoint { ts: 20, val: Some(2.0) }, t);
+        let single = TimeWeightSummary::new(TSNullablePoint::new(20, Some(2.0)), t);
         assert_eq!(
             single.time_weighted_average().unwrap_err(),
             TimeWeightError::ZeroDuration
@@ -865,9 +887,9 @@ mod tests {
 
         let test = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 10, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(2.0) },
-                &TSNullablePoint { ts: 30, val: Some(3.0) },
+                &TSNullablePoint::new(10, Some(1.0)),
+                &TSNullablePoint::new(20, Some(2.0)),
+                &TSNullablePoint::new(30, Some(3.0)),
             ],
             TimeWeightMethod::LOCF,
         )
@@ -876,9 +898,9 @@ mod tests {
         assert_eq!(test.time_weighted_average().unwrap(), expected);
         let test = TimeWeightSummary::new_from_sorted_iter(
             vec![
-                &TSNullablePoint { ts: 10, val: Some(1.0) },
-                &TSNullablePoint { ts: 20, val: Some(2.0) },
-                &TSNullablePoint { ts: 30, val: Some(3.0) },
+                &TSNullablePoint::new(10, Some(1.0)),
+                &TSNullablePoint::new(20, Some(2.0)),
+                &TSNullablePoint::new(30, Some(3.0)),
             ],
             TimeWeightMethod::Linear,
         )

@@ -24,8 +24,8 @@ pg_type! {
     struct TimeWeightSummary {
         first: TSNullablePoint,
         last: TSNullablePoint,
-        weighted_sum: f64,
         method: TimeWeightMethod,
+        weighted_sum: f64,
         duration_data: i64,
     }
 }
@@ -86,10 +86,10 @@ impl<'input> TimeWeightSummary<'input> {
             _ => self.last,
         };
         let mut new_duration_data = self.duration_data;
-        if new_start.val.is_some() {
+        if new_start.val().is_some() {
             new_duration_data += self.first.ts - new_start.ts;
         }
-        if self.last.val.is_some() {
+        if self.last.val().is_some() {
             new_duration_data += new_end.ts - self.last.ts;
         }
 
@@ -187,7 +187,7 @@ pub fn time_weight_trans_inner(
         in_aggregate_context(fcinfo, || {
             let p = match ts {
                 None => return state,
-                Some(ts) => TSNullablePoint { ts: ts.into(), val },
+                Some(ts) => TSNullablePoint::new(ts.into(), val),
             };
 
             match state {
@@ -338,7 +338,7 @@ pub fn arrow_time_weight_first_val<'a>(
 
 #[pg_extern(name = "first_val", strict, immutable, parallel_safe)]
 fn time_weight_first_val<'a>(summary: TimeWeightSummary<'a>) -> Option<f64> {
-    summary.first.val
+    summary.first.val()
 }
 
 #[pg_operator(immutable, parallel_safe)]
@@ -352,7 +352,7 @@ pub fn arrow_time_weight_last_val<'a>(
 
 #[pg_extern(name = "last_val", strict, immutable, parallel_safe)]
 fn time_weight_last_val<'a>(summary: TimeWeightSummary<'a>) -> Option<f64> {
-    summary.last.val
+    summary.last.val()
 }
 
 #[pg_operator(immutable, parallel_safe)]
@@ -539,6 +539,7 @@ mod tests {
         ($client:expr, $stmt:expr, $type:ty) => {
             $client
                 .select($stmt, None, None)
+                .unwrap()
                 .first()
                 .get_one::<$type>()
                 .unwrap()
@@ -850,7 +851,7 @@ mod tests {
                 ORDER BY bucket"#,
                 None,
                 None,
-            );
+            ).unwrap();
             let mut integrals = client.select(
                 r#"SELECT
                 toolkit_experimental.interpolated_integral(
@@ -868,7 +869,7 @@ mod tests {
                 ORDER BY bucket"#,
                 None,
                 None,
-            );
+            ).unwrap();
             // verify that default value works
             client.select(
                 r#"SELECT
@@ -890,29 +891,29 @@ mod tests {
 
             // Day 1, 4 hours @ 10, 4 @ 40, 8 @ 20
             assert_eq!(
-                averages.next().unwrap()[1].value(),
+                averages.next().unwrap()[1].value().unwrap(),
                 Some((4. * 10. + 4. * 40. + 8. * 20.) / 16.)
             );
             assert_eq!(
-                integrals.next().unwrap()[1].value(),
+                integrals.next().unwrap()[1].value().unwrap(),
                 Some(4. * 10. + 4. * 40. + 8. * 20.)
             );
             // Day 2, 2 hours @ 20, 10 @ 15, 8 @ 50, 4 @ 25
             assert_eq!(
-                averages.next().unwrap()[1].value(),
+                averages.next().unwrap()[1].value().unwrap(),
                 Some((2. * 20. + 10. * 15. + 8. * 50. + 4. * 25.) / 24.)
             );
             assert_eq!(
-                integrals.next().unwrap()[1].value(),
+                integrals.next().unwrap()[1].value().unwrap(),
                 Some(2. * 20. + 10. * 15. + 8. * 50. + 4. * 25.)
             );
             // Day 3, 10 hours @ 25, 2 @ 30, 4 @ 0
             assert_eq!(
-                averages.next().unwrap()[1].value(),
+                averages.next().unwrap()[1].value().unwrap(),
                 Some((10. * 25. + 2. * 30.) / 16.)
             );
             assert_eq!(
-                integrals.next().unwrap()[1].value(),
+                integrals.next().unwrap()[1].value().unwrap(),
                 Some(10. * 25. + 2. * 30.)
             );
             assert!(averages.next().is_none());
